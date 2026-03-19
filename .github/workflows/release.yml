@@ -1,0 +1,410 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g., 0.5.12)"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  PACKAGE_NAME: kernel
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, i686, aarch64, riscv64]
+        include:
+          - arch: x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - arch: i686
+            deb_arch: i386
+            rpm_arch: i686
+          - arch: aarch64
+            deb_arch: arm64
+            rpm_arch: aarch64
+          - arch: riscv64
+            deb_arch: riscv64
+            rpm_arch: riscv64
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm
+
+      - name: Install cross-compilation toolchain
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          case "${ARCH}" in
+            x86_64)
+              sudo apt-get install -y binutils
+              ;;
+            i686)
+              sudo apt-get install -y gcc-multilib binutils
+              ;;
+            aarch64)
+              sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+              ;;
+            riscv64)
+              sudo apt-get install -y gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu
+              ;;
+          esac
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build kernel
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p "target/${ARCH}"
+          export RUST_TARGET_PATH="${PWD}/targets"
+
+          cargo rustc \
+            --bin kernel \
+            --manifest-path Cargo.toml \
+            --target "targets/${ARCH}-unknown-kernel.json" \
+            --release \
+            -Z build-std=core,alloc \
+            -- \
+            -C link-arg=-T \
+            -C "link-arg=linkers/${ARCH}.ld" \
+            -C link-arg=-z \
+            -C link-arg=max-page-size=0x1000
+
+          cp "target/${ARCH}-unknown-kernel/release/kernel" "target/${ARCH}/kernel.all" || true
+
+          # Create stripped versions
+          if command -v llvm-objcopy &> /dev/null; then
+            OBJCOPY="llvm-objcopy"
+          else
+            OBJCOPY="objcopy"
+          fi
+
+          if [ -f "target/${ARCH}/kernel.all" ]; then
+            ${OBJCOPY} --only-keep-debug "target/${ARCH}/kernel.all" "target/${ARCH}/kernel.sym" || true
+            ${OBJCOPY} --strip-debug "target/${ARCH}/kernel.all" "target/${ARCH}/kernel" || true
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: kernel-${{ matrix.arch }}
+          path: target/${{ matrix.arch }}/
+          if-no-files-found: error
+
+  package:
+    name: Package (${{ matrix.arch }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: build
+    strategy:
+      matrix:
+        arch: [x86_64, i686, aarch64, riscv64]
+        include:
+          - arch: x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - arch: i686
+            deb_arch: i386
+            rpm_arch: i686
+          - arch: aarch64
+            deb_arch: arm64
+            rpm_arch: aarch64
+          - arch: riscv64
+            deb_arch: riscv64
+            rpm_arch: riscv64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: kernel-${{ matrix.arch }}
+          path: artifacts/
+
+      - name: Get version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -n "${INPUT_VERSION}" ]; then
+            echo "version=${INPUT_VERSION}" >> "${GITHUB_OUTPUT}"
+          else
+            # Extract version from tag (remove 'v' prefix)
+            VERSION="${REF_NAME#v}"
+            echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev rpm
+
+      - name: Create tarball packages
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p packages
+          TARBALL_DIR="kernel-${VERSION}-${ARCH}"
+          mkdir -p "${TARBALL_DIR}/boot"
+          mkdir -p "${TARBALL_DIR}/usr/share/doc/kernel"
+
+          # Copy kernel files
+          cp artifacts/kernel "${TARBALL_DIR}/boot/${ARCH}" || true
+          cp artifacts/kernel.sym "${TARBALL_DIR}/boot/${ARCH}.sym" || true
+
+          # Create README
+          cat > "${TARBALL_DIR}/usr/share/doc/kernel/README" << EOF
+          Microkernel v${VERSION}
+          Architecture: ${ARCH}
+
+          Installation:
+            Copy boot/${ARCH} to your boot partition
+            Configure your bootloader to load this kernel
+
+          Debug Symbols:
+            boot/${ARCH}.sym contains debug symbols for debugging
+          EOF
+
+          # Create .tar
+          tar -cvf "packages/kernel-${VERSION}-${ARCH}.tar" "${TARBALL_DIR}"
+
+          # Create .tar.gz
+          tar -czvf "packages/kernel-${VERSION}-${ARCH}.tar.gz" "${TARBALL_DIR}"
+
+      - name: Create DEB package
+        env:
+          ARCH: ${{ matrix.arch }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          DEB_DIR="deb-build"
+          mkdir -p "${DEB_DIR}/DEBIAN"
+          mkdir -p "${DEB_DIR}/boot"
+          mkdir -p "${DEB_DIR}/usr/share/doc/kernel"
+
+          # Copy kernel files
+          cp artifacts/kernel "${DEB_DIR}/boot/${ARCH}" || true
+          cp artifacts/kernel.sym "${DEB_DIR}/boot/${ARCH}.sym" || true
+
+          # Calculate installed size (in KB)
+          INSTALLED_SIZE=$(du -sk "${DEB_DIR}" | cut -f1)
+
+          # Create control file
+          cat > "${DEB_DIR}/DEBIAN/control" << EOF
+          Package: kernel
+          Version: ${VERSION}
+          Architecture: ${DEB_ARCH}
+          Maintainer: AWFixer OSS Team <oss@awfixer.me>
+          Installed-Size: ${INSTALLED_SIZE}
+          Section: kernel
+          Priority: optional
+          Homepage: https://github.com/awfixer-platform/kernel
+          Description: Microkernel
+           A Unix-like microkernel written in Rust, supporting multiple architectures.
+           This package contains the kernel binary for ${ARCH} architecture.
+          EOF
+
+          # Create copyright file
+          cat > "${DEB_DIR}/usr/share/doc/kernel/copyright" << EOF
+          Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+          Upstream-Name: kernel
+          Source: https://github.com/awfixer-platform/kernel
+
+          Files: *
+          Copyright: AWFixer Enterprises OSS
+          License: MIT
+          EOF
+
+          # Create changelog
+          cat > "${DEB_DIR}/usr/share/doc/kernel/changelog.Debian" << EOF
+          kernel (${VERSION}) unstable; urgency=medium
+
+            * Release ${VERSION}
+
+           -- AWFixer OSS Team <oss@awfixer.me>  $(date -R)
+          EOF
+          gzip -9 "${DEB_DIR}/usr/share/doc/kernel/changelog.Debian"
+
+          # Build the package
+          dpkg-deb --build "${DEB_DIR}" "packages/kernel_${VERSION}_${DEB_ARCH}.deb"
+
+      - name: Create RPM package
+        env:
+          ARCH: ${{ matrix.arch }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Setup RPM build environment
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+
+          # Create source tarball for RPM
+          SOURCE_DIR="kernel-${VERSION}"
+          mkdir -p "${SOURCE_DIR}/boot"
+          cp artifacts/kernel "${SOURCE_DIR}/boot/${ARCH}" || true
+          cp artifacts/kernel.sym "${SOURCE_DIR}/boot/${ARCH}.sym" || true
+          tar -czvf "rpmbuild/SOURCES/kernel-${VERSION}.tar.gz" "${SOURCE_DIR}"
+
+          # Create spec file
+          cat > rpmbuild/SPECS/kernel.spec << EOF
+          Name:           kernel
+          Version:        ${VERSION}
+          Release:        1%{?dist}
+          Summary:        Microkernel for ${ARCH}
+
+          License:        MIT
+          URL:            https://github.com/awfixer-platform/kernel
+          Source0:        %{name}-%{version}.tar.gz
+
+          BuildArch:      ${RPM_ARCH}
+
+          %description
+          A Unix-like microkernel written in Rust, supporting multiple architectures.
+          This package contains the kernel binary for ${ARCH} architecture.
+
+          %prep
+          %setup -q
+
+          %install
+          mkdir -p %{buildroot}/boot
+          mkdir -p %{buildroot}%{_docdir}/%{name}
+          install -m 644 boot/${ARCH} %{buildroot}/boot/ || true
+          install -m 644 boot/${ARCH}.sym %{buildroot}/boot/ || true
+
+          %files
+          /boot/${ARCH}
+          /boot/${ARCH}.sym
+
+          %changelog
+          * $(date "+%a %b %d %Y") AWFixer OSS Team <oss@awfixer.me> - ${VERSION}-1
+          - Release ${VERSION}
+          EOF
+
+          # Build RPM (binary package only, skip debuginfo)
+          rpmbuild --define "_topdir ${PWD}/rpmbuild" \
+                   --define "debug_package %{nil}" \
+                   --target "${RPM_ARCH}" \
+                   -bb rpmbuild/SPECS/kernel.spec || true
+
+          # Copy RPM to packages directory
+          find rpmbuild/RPMS -name "*.rpm" -exec cp {} packages/ \; || true
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v6
+        with:
+          name: packages-${{ matrix.arch }}
+          path: packages/
+          if-no-files-found: warn
+
+  release:
+    name: Create Release
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: package
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all packages
+        uses: actions/download-artifact@v7
+        with:
+          path: all-packages/
+          pattern: packages-*
+          merge-multiple: true
+
+      - name: Get version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -n "${INPUT_VERSION}" ]; then
+            echo "version=${INPUT_VERSION}" >> "${GITHUB_OUTPUT}"
+          else
+            VERSION="${REF_NAME#v}"
+            echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: List packages
+        run: |
+          echo "Packages to be released:"
+          ls -la all-packages/ || echo "No packages found"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        with:
+          name: Microkernel v${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          generate_release_notes: true
+          files: |
+            all-packages/*.tar
+            all-packages/*.tar.gz
+            all-packages/*.deb
+            all-packages/*.rpm
+          body: |
+            ## Microkernel v${{ steps.version.outputs.version }}
+
+            ### Supported Architectures
+            - x86_64 (AMD64)
+            - i686 (x86 32-bit)
+            - aarch64 (ARM 64-bit)
+            - riscv64 (RISC-V 64-bit)
+
+            ### Package Formats
+            - `.tar.gz` / `.tar` - Generic tarball (extract to /)
+            - `.deb` - Debian/Ubuntu packages
+            - `.rpm` - Red Hat/Fedora packages
+
+            ### Installation
+
+            **Debian/Ubuntu:**
+            ```bash
+            sudo dpkg -i kernel_VERSION_ARCH.deb
+            ```
+
+            **Red Hat/Fedora:**
+            ```bash
+            sudo rpm -i kernel-VERSION-1.ARCH.rpm
+            ```
+
+            **Generic:**
+            ```bash
+            sudo tar -xzf kernel-VERSION-ARCH.tar.gz -C /
+            ```
