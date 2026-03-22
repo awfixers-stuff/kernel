@@ -115,7 +115,7 @@ jobs:
           fi
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: kernel-${{ matrix.arch }}
           path: target/${{ matrix.arch }}/
@@ -146,7 +146,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: kernel-${{ matrix.arch }}
           path: artifacts/
@@ -321,7 +321,7 @@ jobs:
           find rpmbuild/RPMS -name "*.rpm" -exec cp {} packages/ \; || true
 
       - name: Upload packages
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.arch }}
           path: packages/
@@ -337,7 +337,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download all packages
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: all-packages/
           pattern: packages-*
